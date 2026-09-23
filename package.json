@@ -2,7 +2,7 @@
   "name": "claude-scheduler",
   "displayName": "Claude Scheduler",
   "description": "Отложенные сообщения в сессии Claude Code: продолжить задачу, когда обновится лимит. Неофициальное расширение.",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "publisher": "skiddgoddamn",
   "license": "MIT",
   "repository": {

@@ -278,7 +278,9 @@ function clearInbox(inbox, sessionId, jobId) {
 
 // ---------- hook line for ~/.claude/settings.json (the user pastes it; we only read settings) ----------
 
-const hookCommand = (hookScript, inbox) => `node "${hookScript.replace(/\\/g, '/')}" "${inbox.replace(/\\/g, '/')}"`;
+// VS Code's fsPath gives "c:\..." while people write "C:/..." — normalise so the settings.json check matches.
+const slashPath = (p) => p.replace(/\\/g, '/').replace(/^([a-z]):/, (m, d) => `${d.toUpperCase()}:`);
+const hookCommand = (hookScript, inbox) => `node "${slashPath(hookScript)}" "${slashPath(inbox)}"`;
 
 function hasHook(settings, command) {
   const hooks = (settings && settings.hooks) || {};

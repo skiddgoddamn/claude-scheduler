@@ -124,6 +124,7 @@ assert.strictEqual(runHook('not json'), '', 'garbage stdin -> silent');
 // hook line: generated snippet is recognised, only when both events are present
 const cmd = lib.hookCommand('C:\\gs\\hook.js', 'C:\\gs\\inbox');
 assert.strictEqual(cmd, 'node "C:/gs/hook.js" "C:/gs/inbox"');
+assert.strictEqual(lib.hookCommand('c:\\gs\\hook.js', 'c:\\gs\\inbox'), cmd, 'VS Code lowercase drive letter matches');
 const snippet = JSON.parse(lib.hookSnippet(cmd));
 assert.ok(lib.hasHook({ hooks: snippet }, cmd));
 assert.ok(!lib.hasHook({ hooks: { PostToolUse: snippet.PostToolUse } }, cmd), 'both events required');
