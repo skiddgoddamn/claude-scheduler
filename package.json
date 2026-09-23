@@ -1,0 +1,196 @@
+{
+  "name": "claude-scheduler",
+  "displayName": "Claude Scheduler",
+  "description": "Отложенные сообщения в сессии Claude Code: продолжить задачу, когда обновится лимит. Неофициальное расширение.",
+  "version": "0.1.0",
+  "publisher": "skiddgoddamn",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/skiddgoddamn/claude-scheduler"
+  },
+  "keywords": [
+    "claude",
+    "claude code",
+    "schedule",
+    "rate limit",
+    "usage limit"
+  ],
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./extension.js",
+  "scripts": {
+    "test": "node test.js",
+    "package": "npx --yes @vscode/vsce package",
+    "publish": "npx --yes @vscode/vsce publish"
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "claudeScheduler.schedule",
+        "title": "Запланировать сообщение",
+        "category": "Claude Scheduler",
+        "icon": "$(clock)"
+      },
+      {
+        "command": "claudeScheduler.runNow",
+        "title": "Отправить сейчас",
+        "category": "Claude Scheduler",
+        "icon": "$(play)"
+      },
+      {
+        "command": "claudeScheduler.remove",
+        "title": "Удалить",
+        "category": "Claude Scheduler",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "claudeScheduler.removeMany",
+        "title": "Удалить несколько…",
+        "category": "Claude Scheduler",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "claudeScheduler.openSession",
+        "title": "Открыть сессию",
+        "category": "Claude Scheduler"
+      },
+      {
+        "command": "claudeScheduler.clearFinished",
+        "title": "Убрать выполненные",
+        "category": "Claude Scheduler",
+        "icon": "$(clear-all)"
+      },
+      {
+        "command": "claudeScheduler.showLog",
+        "title": "Показать лог",
+        "category": "Claude Scheduler",
+        "icon": "$(output)"
+      }
+    ],
+    "views": {
+      "explorer": [
+        {
+          "id": "claudeScheduler.jobs",
+          "name": "Claude: отложенные"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "claudeScheduler.jobs",
+        "contents": "Нет отложенных сообщений.\n[Запланировать сообщение](command:claudeScheduler.schedule)"
+      }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "claudeScheduler.schedule",
+          "when": "activeWebviewPanelId == 'claudeVSCodePanel'",
+          "group": "navigation"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "claudeScheduler.schedule",
+          "when": "view == claudeVSCodeSidebar || view == claudeVSCodeSidebarSecondary || view == claudeScheduler.jobs",
+          "group": "navigation"
+        },
+        {
+          "command": "claudeScheduler.removeMany",
+          "when": "view == claudeScheduler.jobs",
+          "group": "navigation"
+        },
+        {
+          "command": "claudeScheduler.clearFinished",
+          "when": "view == claudeScheduler.jobs",
+          "group": "navigation"
+        },
+        {
+          "command": "claudeScheduler.showLog",
+          "when": "view == claudeScheduler.jobs"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "claudeScheduler.runNow",
+          "when": "view == claudeScheduler.jobs && viewItem != job-running",
+          "group": "inline"
+        },
+        {
+          "command": "claudeScheduler.remove",
+          "when": "view == claudeScheduler.jobs",
+          "group": "inline"
+        },
+        {
+          "command": "claudeScheduler.remove",
+          "when": "view == claudeScheduler.jobs",
+          "group": "1_modify"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "claudeScheduler.runNow",
+          "when": "false"
+        },
+        {
+          "command": "claudeScheduler.remove",
+          "when": "false"
+        },
+        {
+          "command": "claudeScheduler.openSession",
+          "when": "false"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Claude Scheduler",
+      "properties": {
+        "claudeScheduler.permissionMode": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "acceptEdits",
+            "manual",
+            "dontAsk",
+            "plan",
+            "bypassPermissions"
+          ],
+          "default": "auto",
+          "description": "Режим разрешений для фонового продолжения (--permission-mode). Подтвердить действие в фоне некому: всё, что режим не разрешает, будет отклонено."
+        },
+        "claudeScheduler.defaultPrompt": {
+          "type": "string",
+          "default": "Лимит обновился — продолжай задачу с того места, где остановился.",
+          "description": "Текст сообщения по умолчанию."
+        },
+        "claudeScheduler.retryMinutes": {
+          "type": "number",
+          "default": 15,
+          "minimum": 1,
+          "description": "Через сколько минут повторять, если лимит ещё не обновился и время сброса не удалось прочитать из ответа."
+        },
+        "claudeScheduler.claudePath": {
+          "type": "string",
+          "default": "",
+          "description": "Путь к claude. Пусто = бинарь из расширения Claude Code (та же версия, что у панели)."
+        }
+      }
+    },
+    "keybindings": [
+      {
+        "command": "claudeScheduler.remove",
+        "key": "delete",
+        "mac": "cmd+backspace",
+        "when": "focusedView == claudeScheduler.jobs"
+      }
+    ]
+  }
+}
