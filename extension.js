@@ -7,26 +7,41 @@ const path = require('path');
 const lib = require('./lib');
 
 const TICK_MS = 30 * 1000;
+const BUSY_RETRY_MS = 60 * 1000;
 const MAX_ATTEMPTS = 24;
 const SESSION_PICK_LIMIT = 30;
 const CLAUDE_EXT_ID = 'anthropic.claude-code';
 const CLAUDE_PANEL_VIEWTYPE = 'claudeVSCodePanel';
 
 const STATUS = {
-  pending: { icon: 'clock', text: (j) => (j.attempts ? `повтор ${fmt(j.at)} · попытка ${j.attempts + 1}` : fmt(j.at)) },
+  pending: {
+    icon: 'clock',
+    text: (j) => [j.attempts ? `повтор ${fmt(j.at)} · попытка ${j.attempts + 1}` : fmt(j.at), j.note].filter(Boolean).join(' · '),
+  },
+  queued: { icon: 'mail', text: (j) => `ждёт шага Claude с ${fmt(j.queuedAt)}` },
   running: { icon: 'sync~spin', text: () => 'выполняется…' },
   done: { icon: 'pass', text: (j) => `готово ${fmt(j.finishedAt)}` },
   failed: { icon: 'error', text: (j) => `ошибка ${fmt(j.finishedAt)}` },
 };
 
 const running = new Map(); // jobId -> child process started by this window
-let store; // { jobs, locks } paths in globalStorage, shared by all windows
+let store; // paths in globalStorage, shared by all windows
+let hookCmd; // the line the user pastes into ~/.claude/settings.json
+let hookOffered = false;
 let out;
 
 function activate(context) {
   const dir = context.globalStorageUri.fsPath;
-  store = { jobs: path.join(dir, 'jobs.json'), locks: path.join(dir, 'locks') };
+  store = {
+    jobs: path.join(dir, 'jobs.json'),
+    locks: path.join(dir, 'locks'),
+    inbox: path.join(dir, 'inbox'),
+    hookScript: path.join(dir, 'hook.js'),
+  };
   fs.mkdirSync(store.locks, { recursive: true });
+  // Stable path for settings.json; refreshed on every start so it follows extension updates.
+  fs.copyFileSync(path.join(context.extensionPath, 'hook.js'), store.hookScript);
+  hookCmd = lib.hookCommand(store.hookScript, store.inbox);
   out = vscode.window.createOutputChannel('Claude Scheduler');
 
   const changed = new vscode.EventEmitter();
@@ -60,6 +75,7 @@ function activate(context) {
     command('claudeScheduler.openSession', openSession),
     command('claudeScheduler.clearFinished', () => remove(lib.loadJobs(store.jobs).filter(isFinished), refresh)),
     command('claudeScheduler.showLog', () => out.show()),
+    command('claudeScheduler.setupHook', showHookSetup),
   );
   tick(refresh);
 }
@@ -142,8 +158,11 @@ async function schedule(refresh) {
   tick(refresh);
 }
 
+// A fresh seq also frees a job whose step was cut short (VS Code killed mid-run left its lock behind).
 async function runNow(job, refresh) {
-  lib.updateJob(store.jobs, job.id, { status: 'pending', at: Date.now() });
+  const fresh = lib.loadJobs(store.jobs).find((j) => j.id === job.id);
+  if (!fresh) return;
+  lib.updateJob(store.jobs, job.id, { status: 'pending', at: Date.now(), seq: (fresh.seq || 0) + 1, note: undefined });
   tick(refresh);
 }
 
@@ -165,6 +184,7 @@ async function remove(jobs, refresh) {
   for (const job of jobs) {
     lib.removeJob(store.jobs, job.id);
     lib.dropLocks(store.locks, job.id);
+    lib.clearInbox(store.inbox, job.sessionId, job.id); // so the hook won't deliver a cancelled message
   }
   refresh();
 }
@@ -188,9 +208,8 @@ function tick(refresh) {
   try {
     const now = Date.now();
     for (const job of lib.loadJobs(store.jobs)) {
-      if (job.status === 'pending' && job.at <= now) {
-        runJob(job, refresh).catch((e) => log(`✖ ${e.stack || e}`));
-      }
+      if (job.status === 'pending' && job.at <= now) step(job, fire, refresh);
+      if (job.status === 'queued' && queuedNeedsAction(job)) step(job, checkQueued, refresh);
     }
   } catch (e) {
     log(`✖ tick: ${e.stack || e}`);
@@ -198,23 +217,75 @@ function tick(refresh) {
   refresh();
 }
 
-async function runJob(job, refresh) {
-  if (!lib.claim(store.locks, `${job.id}-${job.attempts}`)) return; // another window took it
+// Every state change runs under a lock keyed by the job's seq, held for the whole step, so it happens in exactly
+// one window. seq is bumped before the lock is released: a window with a stale copy then fails the seq check.
+function step(job, fn, refresh) {
+  const seq = job.seq || 0;
+  const key = `${job.id}-${seq}`;
+  if (!lib.claim(store.locks, key)) return;
   const fresh = lib.loadJobs(store.jobs).find((j) => j.id === job.id);
-  if (!fresh || fresh.status !== 'pending' || fresh.attempts !== job.attempts) return;
-
-  const attempt = fresh.attempts + 1;
-  lib.updateJob(store.jobs, fresh.id, { status: 'running', attempts: attempt, startedAt: Date.now() });
-  refresh();
-  log(`▶ «${fresh.title}» (${fresh.sessionId}), попытка ${attempt}`);
-
-  const verdict = lib.interpretRun(await runClaude(fresh));
-  log(`${verdict.kind === 'done' ? '✔' : '✖'} ${verdict.kind}: ${verdict.text}`);
-  settle(fresh, attempt, verdict);
-  refresh();
+  if (!fresh || (fresh.seq || 0) !== seq || fresh.status !== job.status) {
+    lib.release(store.locks, key);
+    return;
+  }
+  Promise.resolve()
+    .then(() => fn(fresh, refresh))
+    .catch((e) => log(`✖ ${e.stack || e}`))
+    .finally(() => {
+      lib.updateJob(store.jobs, job.id, { seq: seq + 1 });
+      lib.release(store.locks, key);
+      refresh();
+    });
 }
 
-function settle(job, attempt, { kind, text }) {
+// Resuming a busy session from here would fork it: hand the message to its own process via the hook instead.
+async function fire(job, refresh) {
+  if (!job.file || !lib.isSessionBusy(job.file)) return runHeadless(job, refresh);
+  if (lib.hookInstalled(hookCmd)) {
+    lib.putInbox(store.inbox, job.sessionId, job.id, job.prompt);
+    lib.updateJob(store.jobs, job.id, { status: 'queued', queuedAt: Date.now(), note: undefined });
+    log(`✉ «${job.title}»: Claude работает — сообщение придёт в текущий ход`);
+    return;
+  }
+  lib.updateJob(store.jobs, job.id, { at: Date.now() + BUSY_RETRY_MS, note: 'сессия работает, жду конца хода' });
+  log(`⏸ «${job.title}»: Claude работает, хук не подключён — жду конца хода`);
+  offerHookSetup();
+}
+
+function queuedNeedsAction(job) {
+  const st = lib.inboxState(store.inbox, job.sessionId, job.id);
+  return st !== 'waiting' || !job.file || !lib.isSessionBusy(job.file);
+}
+
+function checkQueued(job) {
+  const st = lib.inboxState(store.inbox, job.sessionId, job.id);
+  if (st === 'taken') {
+    lib.clearInbox(store.inbox, job.sessionId, job.id);
+    const saved = lib.updateJob(store.jobs, job.id, { status: 'done', finishedAt: Date.now(), result: 'доставлено в идущий ход' });
+    log(`✔ «${job.title}»: доставлено в идущий ход`);
+    if (saved) vscode.window.showInformationMessage(`Сообщение доставлено в «${saved.title}» во время работы Claude`);
+    return;
+  }
+  // The turn ended without picking it up (hit the limit, panel closed...): take it back and resume in background.
+  if (st === 'missing' || lib.withdrawInbox(store.inbox, job.sessionId, job.id)) {
+    lib.clearInbox(store.inbox, job.sessionId, job.id);
+    lib.updateJob(store.jobs, job.id, { status: 'pending', at: Date.now() });
+    log(`↩ «${job.title}»: сессия освободилась — отправлю в фоне`);
+  }
+  // withdraw lost to the hook -> the next tick sees 'taken'
+}
+
+async function runHeadless(job, refresh) {
+  const attempt = (job.attempts || 0) + 1;
+  lib.updateJob(store.jobs, job.id, { status: 'running', attempts: attempt, startedAt: Date.now(), note: undefined });
+  refresh();
+  log(`▶ «${job.title}» (${job.sessionId}), попытка ${attempt}`);
+  const verdict = lib.interpretRun(await runClaude(job));
+  log(`${verdict.kind === 'done' ? '✔' : '✖'} ${verdict.kind}: ${verdict.text}`);
+  await settle(job, attempt, verdict);
+}
+
+async function settle(job, attempt, { kind, text }) {
   if (kind === 'limit' && attempt < MAX_ATTEMPTS) {
     const at = lib.nextRetryAt(text, new Date(), config().get('retryMinutes'));
     if (lib.updateJob(store.jobs, job.id, { status: 'pending', at, lastError: text })) log(`⏳ лимит, повтор ${fmt(at)}`);
@@ -228,7 +299,12 @@ function settle(job, attempt, { kind, text }) {
   });
   if (!saved) return; // removed while running
   if (done) {
-    vscode.window.showInformationMessage(`Claude продолжил «${saved.title}»`, 'Открыть сессию').then((b) => b && openSession(saved));
+    // The open tab still shows the transcript it loaded before this run: reload it so the answer is visible.
+    if (await reloadSessionTab(saved)) {
+      vscode.window.showInformationMessage(`Claude продолжил «${saved.title}» — вкладка обновлена`);
+    } else {
+      vscode.window.showInformationMessage(`Claude продолжил «${saved.title}»`, 'Открыть сессию').then((b) => b && openSession(saved));
+    }
   } else {
     vscode.window.showErrorMessage(`Не удалось продолжить «${saved.title}»: ${text.slice(0, 200)}`, 'Показать лог').then((b) => b && out.show());
   }
@@ -271,9 +347,9 @@ function claudeBinary(cfg) {
   return bundled && fs.existsSync(bundled) ? bundled : 'claude';
 }
 
-// An open tab of this session keeps showing the old transcript; close it so the panel reloads from disk.
-// ponytail: tabs are matched by title (the Claude extension exposes no session id); no match -> old tab is just revealed.
-async function openSession(job) {
+// An open tab of a session keeps the transcript it loaded; closing and reopening reloads it from disk.
+// ponytail: tabs are matched by title (the Claude extension exposes no session id); no match -> nothing to reload.
+async function reloadSessionTab(job) {
   const titles = [job.title];
   try {
     if (job.file) titles.push(lib.readSessionMeta(job.file).title);
@@ -284,14 +360,53 @@ async function openSession(job) {
     .flatMap((g) => g.tabs)
     .filter((t) => t.input instanceof vscode.TabInputWebview && t.input.viewType.endsWith(CLAUDE_PANEL_VIEWTYPE))
     .filter((t) => titles.some((title) => sameTitle(t.label, title)));
-  if (stale.length) await vscode.window.tabGroups.close(stale);
+  if (!stale.length) return false;
+  await vscode.window.tabGroups.close(stale);
   await vscode.commands.executeCommand('claude-vscode.editor.open', job.sessionId);
+  return true;
+}
+
+async function openSession(job) {
+  if (!(await reloadSessionTab(job))) await vscode.commands.executeCommand('claude-vscode.editor.open', job.sessionId);
+}
+
+// ---------- hook setup (the user edits ~/.claude/settings.json; the extension only reads it) ----------
+
+function offerHookSetup() {
+  if (hookOffered) return;
+  hookOffered = true;
+  vscode.window
+    .showInformationMessage(
+      'Сессия сейчас работает, поэтому сообщение ждёт конца хода. Чтобы оно приходило прямо в идущий ход, подключите хук Claude Code — одна вставка в ~/.claude/settings.json.',
+      'Подключить',
+    )
+    .then((b) => b && showHookSetup());
+}
+
+async function showHookSetup() {
+  if (lib.hookInstalled(hookCmd)) {
+    vscode.window.showInformationMessage('Хук уже подключён: сообщения в работающие сессии приходят в идущий ход.');
+    return;
+  }
+  const snippet = lib.hookSnippet(hookCmd);
+  await vscode.env.clipboard.writeText(snippet);
+  const doc = await vscode.workspace.openTextDocument({
+    language: 'jsonc',
+    content:
+      '// Добавьте эти записи в раздел "hooks" файла ~/.claude/settings.json.\n' +
+      '// Если там уже есть PostToolUse / Stop — допишите объекты в конец их массивов.\n' +
+      '// Фрагмент уже в буфере обмена. Claude Code подхватит изменение сам, перезапуск не нужен.\n' +
+      `${snippet}\n`,
+  });
+  await vscode.window.showTextDocument(doc, { preview: false });
+  const open = await vscode.window.showInformationMessage('Фрагмент хука скопирован в буфер обмена.', 'Открыть settings.json');
+  if (open) await vscode.window.showTextDocument(vscode.Uri.file(lib.SETTINGS_FILE));
 }
 
 // ---------- view ----------
 
 function sortJobs(jobs) {
-  const active = jobs.filter((j) => j.status === 'pending' || j.status === 'running').sort((a, b) => a.at - b.at);
+  const active = jobs.filter((j) => ['pending', 'queued', 'running'].includes(j.status)).sort((a, b) => a.at - b.at);
   const finished = jobs.filter((j) => j.status === 'done' || j.status === 'failed').sort((a, b) => b.finishedAt - a.finishedAt);
   return [...active, ...finished];
 }
@@ -325,9 +440,11 @@ function updateStatus(status) {
     return status.hide();
   }
   const pending = jobs.filter((j) => j.status === 'pending').sort((a, b) => a.at - b.at);
+  const queued = jobs.filter((j) => j.status === 'queued').length;
   const busy = jobs.some((j) => j.status === 'running');
-  if (!pending.length && !busy) return status.hide();
-  status.text = `$(${busy ? 'sync~spin' : 'clock'}) ${pending.length ? `${pending.length} · ${fmt(pending[0].at)}` : 'Claude продолжает…'}`;
+  if (!pending.length && !queued && !busy) return status.hide();
+  const parts = [pending.length && `${pending.length} · ${fmt(pending[0].at)}`, queued && `✉ ${queued}`].filter(Boolean);
+  status.text = `$(${busy ? 'sync~spin' : 'clock'}) ${parts.join('  ') || 'Claude продолжает…'}`;
   status.tooltip = 'Отложенные сообщения Claude';
   status.show();
 }

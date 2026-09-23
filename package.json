@@ -2,7 +2,7 @@
   "name": "claude-scheduler",
   "displayName": "Claude Scheduler",
   "description": "Отложенные сообщения в сессии Claude Code: продолжить задачу, когда обновится лимит. Неофициальное расширение.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publisher": "skiddgoddamn",
   "license": "MIT",
   "repository": {
@@ -73,6 +73,12 @@
         "title": "Показать лог",
         "category": "Claude Scheduler",
         "icon": "$(output)"
+      },
+      {
+        "command": "claudeScheduler.setupHook",
+        "title": "Подключить доставку в идущий ход",
+        "category": "Claude Scheduler",
+        "icon": "$(plug)"
       }
     ],
     "views": {
@@ -116,12 +122,16 @@
         {
           "command": "claudeScheduler.showLog",
           "when": "view == claudeScheduler.jobs"
+        },
+        {
+          "command": "claudeScheduler.setupHook",
+          "when": "view == claudeScheduler.jobs"
         }
       ],
       "view/item/context": [
         {
           "command": "claudeScheduler.runNow",
-          "when": "view == claudeScheduler.jobs && viewItem != job-running",
+          "when": "view == claudeScheduler.jobs && viewItem =~ /^job-(pending|done|failed)$/",
           "group": "inline"
         },
         {

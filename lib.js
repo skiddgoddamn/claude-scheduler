@@ -3,7 +3,11 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-const PROJECTS_DIR = path.join(os.homedir(), '.claude', 'projects');
+const CLAUDE_HOME = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
+const PROJECTS_DIR = path.join(CLAUDE_HOME, 'projects');
+const SETTINGS_FILE = path.join(CLAUDE_HOME, 'settings.json');
+const HOOK_EVENTS = ['PostToolUse', 'Stop'];
+const TURN_END = new Set(['end_turn', 'stop_sequence', 'max_tokens', 'refusal']);
 const HEAD_BYTES = 64 * 1024;
 const TAIL_BYTES = 256 * 1024;
 const TITLE_MAX = 60;
@@ -11,6 +15,7 @@ const RESULT_MAX = 2000;
 const RESET_BUFFER_MS = 2 * 60 * 1000;
 const MINUTE = 60 * 1000;
 const HOUR = 60 * MINUTE;
+const STALE_MS = 15 * MINUTE;
 
 // ---------- sessions (~/.claude/projects/<slug>/<uuid>.jsonl) ----------
 
@@ -203,13 +208,107 @@ function claim(lockDir, key) {
   }
 }
 
+function release(lockDir, key) {
+  fs.rmSync(path.join(lockDir, `${key}.lock`), { force: true });
+}
+
 function dropLocks(lockDir, id) {
   for (const name of fs.readdirSync(lockDir)) {
     if (name.startsWith(`${id}-`)) fs.rmSync(path.join(lockDir, name), { force: true });
   }
 }
 
+// ---------- is the session mid-turn? ----------
+
+function isInterrupt(entry) {
+  const c = entry.message && entry.message.content;
+  const text = typeof c === 'string' ? c : Array.isArray(c) ? c.map((p) => p.text || '').join('') : '';
+  return text.startsWith('[Request interrupted');
+}
+
+// Busy = its process is mid-turn: the last message is a tool call or a prompt still waiting for the model.
+// Resuming a busy session from another process forks it, so busy sessions get messages via the hook.
+// A transcript untouched for STALE_MS counts as idle (process closed or crashed mid-turn).
+function isSessionBusy(file, now = Date.now()) {
+  let st;
+  try {
+    st = fs.statSync(file);
+  } catch {
+    return false;
+  }
+  if (now - st.mtimeMs > STALE_MS) return false;
+  const tail = parseLines(readChunk(file, Math.max(0, st.size - TAIL_BYTES), Math.min(st.size, TAIL_BYTES)));
+  const last = [...tail].reverse().find((e) => (e.type === 'user' || e.type === 'assistant') && !e.isSidechain);
+  if (!last) return false;
+  if (last.type === 'assistant') return !TURN_END.has(last.message && last.message.stop_reason);
+  return !isInterrupt(last);
+}
+
+// ---------- inbox read by hook.js: <inbox>/<sessionId>/<jobId>.msg ----------
+
+const inboxFile = (inbox, sessionId, jobId, ext) => path.join(inbox, path.basename(sessionId), `${jobId}.${ext}`);
+
+function putInbox(inbox, sessionId, jobId, text) {
+  const tmp = inboxFile(inbox, sessionId, jobId, 'tmp');
+  fs.mkdirSync(path.dirname(tmp), { recursive: true });
+  fs.writeFileSync(tmp, text);
+  fs.renameSync(tmp, inboxFile(inbox, sessionId, jobId, 'msg'));
+}
+
+// 'waiting' | 'taken' (hook delivered it) | 'missing'
+function inboxState(inbox, sessionId, jobId) {
+  if (fs.existsSync(inboxFile(inbox, sessionId, jobId, 'taken'))) return 'taken';
+  if (fs.existsSync(inboxFile(inbox, sessionId, jobId, 'msg'))) return 'waiting';
+  return 'missing';
+}
+
+// Take the message back before the hook does; false when the hook was faster.
+function withdrawInbox(inbox, sessionId, jobId) {
+  try {
+    fs.renameSync(inboxFile(inbox, sessionId, jobId, 'msg'), inboxFile(inbox, sessionId, jobId, 'withdrawn'));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function clearInbox(inbox, sessionId, jobId) {
+  for (const ext of ['msg', 'taken', 'withdrawn', 'tmp']) fs.rmSync(inboxFile(inbox, sessionId, jobId, ext), { force: true });
+}
+
+// ---------- hook line for ~/.claude/settings.json (the user pastes it; we only read settings) ----------
+
+const hookCommand = (hookScript, inbox) => `node "${hookScript.replace(/\\/g, '/')}" "${inbox.replace(/\\/g, '/')}"`;
+
+function hasHook(settings, command) {
+  const hooks = (settings && settings.hooks) || {};
+  return HOOK_EVENTS.every((ev) => (hooks[ev] || []).some((g) => (g.hooks || []).some((h) => h.command === command)));
+}
+
+function hookInstalled(command, file = SETTINGS_FILE) {
+  try {
+    return hasHook(JSON.parse(fs.readFileSync(file, 'utf8')), command);
+  } catch {
+    return false;
+  }
+}
+
+function hookSnippet(command) {
+  const entry = [{ matcher: '*', hooks: [{ type: 'command', command }] }];
+  return JSON.stringify(Object.fromEntries(HOOK_EVENTS.map((ev) => [ev, entry])), null, 2);
+}
+
 module.exports = {
+  SETTINGS_FILE,
+  isSessionBusy,
+  putInbox,
+  inboxState,
+  withdrawInbox,
+  clearInbox,
+  hookCommand,
+  hasHook,
+  hookInstalled,
+  hookSnippet,
   listSessions,
   readSessionMeta,
   parseWhen,
@@ -221,5 +320,6 @@ module.exports = {
   updateJob,
   removeJob,
   claim,
+  release,
   dropLocks,
 };

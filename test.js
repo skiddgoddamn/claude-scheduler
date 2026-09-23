@@ -1,5 +1,6 @@
 // Run: node test.js
 const assert = require('assert');
+const cp = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -74,6 +75,63 @@ assert.strictEqual(sessions[1].title, 'Починка логина', 'latest ai-
 assert.strictEqual(sessions[1].cwd, 'd:\\work');
 assert.strictEqual(sessions[0].title, 'почини логин', 'falls back to first real prompt');
 assert.strictEqual(lib.listSessions(1, path.join(tmp, 'projects')).length, 1);
+
+// isSessionBusy: mid-turn sessions must not be resumed from another process
+const sess = (name, entries, ageMs = 0) => {
+  const f = path.join(tmp, `${name}.jsonl`);
+  fs.writeFileSync(f, entries.map((e) => JSON.stringify(e)).join('\n') + '\n');
+  const t = new Date(Date.now() - ageMs);
+  fs.utimesSync(f, t, t);
+  return f;
+};
+const asst = (stop, extra) => ({ type: 'assistant', message: { stop_reason: stop, content: [{ type: 'text', text: 'x' }] }, ...extra });
+const usr = (text) => ({ type: 'user', message: { content: text } });
+assert.strictEqual(lib.isSessionBusy(sess('b1', [usr('go'), asst('tool_use')])), true, 'tool call in flight');
+assert.strictEqual(lib.isSessionBusy(sess('b2', [usr('go')])), true, 'prompt waiting for the model');
+assert.strictEqual(lib.isSessionBusy(sess('b3', [usr('go'), asst('end_turn'), { type: 'ai-title', aiTitle: 't' }])), false, 'turn ended');
+assert.strictEqual(lib.isSessionBusy(sess('b4', [usr('go'), asst('stop_sequence', { error: 'rate_limit', isApiErrorMessage: true })])), false, 'hit the limit');
+assert.strictEqual(lib.isSessionBusy(sess('b5', [asst('tool_use'), usr('[Request interrupted by user for tool use]')])), false, 'interrupted');
+assert.strictEqual(lib.isSessionBusy(sess('b6', [usr('go'), asst('tool_use')], 20 * MIN)), false, 'stale transcript');
+assert.strictEqual(lib.isSessionBusy(sess('b7', [usr('go'), asst('end_turn'), asst('tool_use', { isSidechain: true })])), false, 'subagent entries ignored');
+assert.strictEqual(lib.isSessionBusy(path.join(tmp, 'nope.jsonl')), false);
+
+// inbox + the real hook.js as a separate process
+const inbox = path.join(tmp, 'inbox');
+const runHook = (stdin) => cp.execFileSync(process.execPath, [path.join(__dirname, 'hook.js'), inbox], { input: stdin }).toString();
+const hook = (event) => runHook(JSON.stringify(event));
+assert.strictEqual(hook({ session_id: 'S', hook_event_name: 'PostToolUse' }), '', 'empty inbox -> silent');
+lib.putInbox(inbox, 'S', 'j1', 'стоп, сначала бэкап');
+assert.strictEqual(lib.inboxState(inbox, 'S', 'j1'), 'waiting');
+assert.strictEqual(hook({ session_id: 'S', hook_event_name: 'PostToolUse', agent_id: 'sub' }), '', 'subagent does not take it');
+assert.strictEqual(hook({ session_id: 'OTHER', hook_event_name: 'PostToolUse' }), '', 'other session does not take it');
+const post = JSON.parse(hook({ session_id: 'S', hook_event_name: 'PostToolUse' }));
+assert.strictEqual(post.hookSpecificOutput.hookEventName, 'PostToolUse');
+assert.ok(post.hookSpecificOutput.additionalContext.includes('стоп, сначала бэкап'));
+assert.strictEqual(lib.inboxState(inbox, 'S', 'j1'), 'taken');
+assert.strictEqual(hook({ session_id: 'S', hook_event_name: 'PostToolUse' }), '', 'delivered once');
+assert.strictEqual(lib.withdrawInbox(inbox, 'S', 'j1'), false, 'too late to withdraw');
+lib.putInbox(inbox, 'S', 'j2', 'продолжай');
+const stop = JSON.parse(hook({ session_id: 'S', hook_event_name: 'Stop', stop_hook_active: false }));
+assert.strictEqual(stop.decision, 'block');
+assert.ok(stop.reason.includes('продолжай'));
+lib.putInbox(inbox, 'S', 'j3', 'x');
+assert.strictEqual(lib.withdrawInbox(inbox, 'S', 'j3'), true);
+assert.strictEqual(lib.inboxState(inbox, 'S', 'j3'), 'missing');
+lib.clearInbox(inbox, 'S', 'j1');
+assert.strictEqual(lib.inboxState(inbox, 'S', 'j1'), 'missing');
+assert.strictEqual(runHook('not json'), '', 'garbage stdin -> silent');
+
+// hook line: generated snippet is recognised, only when both events are present
+const cmd = lib.hookCommand('C:\\gs\\hook.js', 'C:\\gs\\inbox');
+assert.strictEqual(cmd, 'node "C:/gs/hook.js" "C:/gs/inbox"');
+const snippet = JSON.parse(lib.hookSnippet(cmd));
+assert.ok(lib.hasHook({ hooks: snippet }, cmd));
+assert.ok(!lib.hasHook({ hooks: { PostToolUse: snippet.PostToolUse } }, cmd), 'both events required');
+const settingsFile = path.join(tmp, 'settings.json');
+const other = { matcher: '*', hooks: [{ type: 'command', command: 'other' }] };
+fs.writeFileSync(settingsFile, JSON.stringify({ hooks: { Stop: [other, ...snippet.Stop], PostToolUse: snippet.PostToolUse } }));
+assert.ok(lib.hookInstalled(cmd, settingsFile));
+assert.ok(!lib.hookInstalled(cmd, path.join(tmp, 'missing.json')));
 
 fs.rmSync(tmp, { recursive: true, force: true });
 console.log('ok');
